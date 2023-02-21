@@ -13,9 +13,9 @@ use fuzzywuzzy::{fuzz, process::extract_one, utils};
 use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const IGNORED_TYPES: &[&str] = &["html"];
+const IGNORED_TYPES: &[&str] = &["html", "hash"];
 const IGNORED_FILES: &[&str] = &[
     "metadata.json",
     "shared_album_comments.json",
@@ -747,6 +747,16 @@ impl<'a> Processor<'_> {
                 counter += 1;
 
                 futures.push(async move {
+                    let hash_file_name = media_file.media_path.with_extension("hash");
+
+                    // if there exists a hash file already, just grab the hash from that
+                    if hash_file_name.exists() {
+                        let mut hash_file = tokio::fs::File::open(&hash_file_name).await.unwrap();
+                        let mut hash = String::new();
+                        hash_file.read_to_string(&mut hash).await.unwrap();
+                        return hash;
+                    }
+
                     let mut hasher = Sha3_256::new();
                     let mut file = tokio::fs::File::open(&media_file.media_path).await.unwrap();
                     let mut buf = [0; 1024];
@@ -761,7 +771,13 @@ impl<'a> Processor<'_> {
                     println!("Hashing file {}/{}", num, total_files);
 
                     let hash = hasher.finalize_reset();
-                    format!("{:x}", hash)
+                    let hash = format!("{:x}", hash);
+
+                    // save the hash to a file NEXT to the file
+                    let mut hash_file = tokio::fs::File::create(&hash_file_name).await.unwrap();
+                    hash_file.write_all(hash.as_bytes()).await.unwrap();
+
+                    hash
                 });
             }
 
@@ -795,14 +811,17 @@ impl<'a> Processor<'_> {
         }
 
         // remove all files from the files array, comparing on the source path
-        let to_be_removed: HashSet<String> = files
-            .iter()
-            .flat_map(|(_, v)| v.iter())
-            .map(|f| f.media_path.to_str().unwrap().to_string())
-            .collect();
-        println!("Removing {} files", to_be_removed.len());
+        let mut to_be_removed: HashSet<String> = HashSet::new();
+
+        for (_, files) in files.iter() {
+            for file in files {
+                to_be_removed.insert(file.media_path.display().to_string());
+            }
+        }
+
+        println!("Removing {} duplicate files from array", to_be_removed.len());
         self.media_files
-            .retain(|f| !to_be_removed.contains(&f.media_path.to_str().unwrap().to_string()));
+            .retain(|f| !to_be_removed.contains(&f.media_path.display().to_string()));
 
         Ok(())
     }
